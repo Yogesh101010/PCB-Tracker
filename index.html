@@ -291,8 +291,13 @@ img { max-width: 100%; }
 [hidden] { display: none !important; }
 .folderbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); font-size: 14px; color: var(--muted); }
 .folderbar b { color: var(--fg); }
+.folderbar a, .cfoot a { color: var(--mask); font-weight: 600; }
 .folderbar input { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); min-width: 0; width: 180px; }
 .folderbar > span:first-child { flex: 1 1 220px; }
+.folderbar select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.folderbar .pend { color: var(--prog); font-weight: 600; }
+.steps { margin: 0; padding-left: 20px; display: grid; gap: 6px; }
+.steps a { color: var(--mask); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -375,6 +380,26 @@ img { max-width: 100%; }
   </form>
 </dialog>
 
+<dialog id="ghDlg">
+  <form class="dlg" id="ghForm" novalidate>
+    <h2>Editor sign in</h2>
+    <p class="hint">Viewers don't need this. Only the editor signs in, with a GitHub token that can write to this repository. The token stays in this browser only.</p>
+    <ol class="hint steps">
+      <li>Sign in to GitHub as an account that can push to this repository.</li>
+      <li>Open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">New fine-grained token</a>. Under Repository access choose <b>Only select repositories</b> and pick this repository. Under Permissions set <b>Contents</b> to <b>Read and write</b>. Generate it and copy it.</li>
+      <li>If you are a collaborator and the repository belongs to someone else's personal account, GitHub won't offer it there. Make a <a href="https://github.com/settings/tokens/new?scopes=public_repo&description=PCB%20Tracker" target="_blank" rel="noopener">classic token</a> with only <b>public_repo</b> ticked instead.</li>
+    </ol>
+    <div class="field"><label for="gRepo">Repository (owner/name)</label><input id="gRepo" autocomplete="off" placeholder="owner/repository"></div>
+    <div class="field"><label for="gToken">Token</label><input id="gToken" type="password" autocomplete="off" placeholder="github_pat_… or ghp_…"></div>
+    <p class="err" id="gErr" hidden></p>
+    <div class="dfoot">
+      <span class="sp"></span>
+      <button class="btn" type="button" id="gCancel">Cancel</button>
+      <button class="btn primary" type="submit" id="gSave">Sign in</button>
+    </div>
+  </form>
+</dialog>
+
 <div class="toast" id="toast" hidden></div>
 
 <script src="xlsx.full.min.js"></script>
@@ -423,13 +448,17 @@ const safeName = s => String(s).replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").repla
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 
 let root = null, dirP = null, dirJ = null, savedHandle = null, setupMsg = "", loading = false, busy = false, unreadable = [];
+let web = false, inGit = false, manifestText = "";  // web: read-only view of the files published next to this page
+let gh = null, booting = true;  // gh: { repo, token, branch } once the editor signs in on the published site
 let projects = [], pcbs = [];
-let view = { type: "pcbs" }, filter = "all", query = "", sortBy = "updated", me = "";
+let view = { type: "pcbs" }, filter = "all", query = "", sortBy = "updated", me = "", pubMode = "60";
 try {
   const v = JSON.parse(localStorage.getItem("pcb.view") || "null"); if (v && ["pcbs", "projects", "project"].includes(v.type)) view = v;
   sortBy = localStorage.getItem("pcb.sort") || "updated";
   me = localStorage.getItem("pcb.me") || "";
+  pubMode = localStorage.getItem("pcb.publish") || "60";
 } catch (e) {}
+const canEdit = () => !!(root || gh);
 function go(v) { view = v; try { localStorage.setItem("pcb.view", JSON.stringify(v)); } catch (e) {} render(); window.scrollTo(0, 0); }
 
 /* ---------- folder + Excel storage ---------- */
@@ -443,7 +472,8 @@ async function useFolder(h) {
   dirP = await h.getDirectoryHandle("pcbs", { create: true });
   dirJ = await h.getDirectoryHandle("projects", { create: true });
   try { await IDB.set("root", h); } catch (e) {}
-  setupMsg = "";
+  try { await h.getDirectoryHandle(".git"); inGit = true; } catch (e) { inGit = false; }
+  setupMsg = ""; manifestText = "";
   await loadAll();
 }
 async function chooseFolder() {
@@ -456,7 +486,140 @@ async function reopenFolder() {
     else { setupMsg = "The browser wasn't allowed to use the folder. Click again and choose Allow, or pick the folder again."; render(); }
   } catch (e) { setupMsg = "That folder can't be opened any more. Choose it again."; savedHandle = null; render(); }
 }
-async function readBook(fh) { const f = await fh.getFile(); return XLSX.read(await f.arrayBuffer(), { type: "array" }); }
+const isBook = name => /\.xlsx$/i.test(name) && !name.startsWith("~$");
+async function folderFiles(dir) {
+  const out = [];
+  for await (const [name, h] of dir.entries()) if (h.kind === "file" && isBook(name)) out.push({ name, read: async () => (await h.getFile()).arrayBuffer() });
+  return out;
+}
+function webFiles(sub, names) {
+  return (names || []).filter(isBook).map(name => ({ name, read: async () => {
+    const r = await fetch(sub + "/" + encodeURIComponent(name), { cache: "no-cache" });
+    if (!r.ok) throw new Error(r.status); return r.arrayBuffer();
+  } }));
+}
+async function fetchManifest() {
+  const r = await fetch("files.json", { cache: "no-cache" });
+  if (!r.ok) throw new Error("files.json: " + r.status);
+  return r.json();
+}
+/* files.json lists the Excel files so the published page (which can't list folders) knows what to load. */
+async function writeManifest(pf, jf) {
+  const text = JSON.stringify({ pcbs: pf.map(f => f.name).sort(byName), projects: jf.map(f => f.name).sort(byName) }, null, 2) + "\n";
+  if (gh) {
+    const cur = pending.has("files.json") ? pending.get("files.json") : ghTree.has("files.json") ? await blob(ghTree.get("files.json")) : null;
+    if (!cur || new TextDecoder().decode(cur) !== text) stage("files.json", new TextEncoder().encode(text));
+    return;
+  }
+  if (text === manifestText) return;
+  try {
+    let old = ""; try { old = await (await (await root.getFileHandle("files.json")).getFile()).text(); } catch (e) {}
+    if (old !== text) { const w = await (await root.getFileHandle("files.json", { create: true })).createWritable(); await w.write(text); await w.close(); }
+    manifestText = text;
+  } catch (e) {}
+}
+
+/* ---------- GitHub storage: the editor saves straight to the repository ----------
+   Saves are kept in this browser (pending) and sent to GitHub together as one commit,
+   after a quiet period or when the editor clicks Publish, so a burst of edits is one commit. */
+const PUBLISH = [["0", "Publish after each save"], ["60", "Publish 1 min after last save"], ["300", "Publish 5 min after last save"], ["manual", "Publish only when I click"]];
+let ghTree = null;           // path -> blob sha on the branch
+const blobs = new Map();     // sha -> bytes, so unchanged files are downloaded once
+let pending = new Map();     // path -> bytes, or null to delete; saved here but not yet on GitHub
+let notes = [], pubTimer = null, publishing = false;
+async function api(path, { method = "GET", body, raw } = {}) {
+  const r = await fetch(`https://api.github.com/repos/${gh.repo}${path ? "/" + path : ""}`, { method, cache: "no-store", body: body && JSON.stringify(body),
+    headers: { Authorization: "Bearer " + gh.token, Accept: raw ? "application/vnd.github.raw" : "application/vnd.github+json", ...(body ? { "Content-Type": "application/json" } : {}) } });
+  if (!r.ok) { let m = ""; try { m = (await r.json()).message; } catch (e) {} const e = new Error(m || "GitHub answered " + r.status); e.status = r.status; throw e; }
+  return raw ? r.arrayBuffer() : r.json();
+}
+async function blob(sha) { if (!blobs.has(sha)) blobs.set(sha, new Uint8Array(await api("git/blobs/" + sha, { raw: true }))); return blobs.get(sha); }
+function b64(u8) { let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); }
+async function loadTree() {
+  const t = await api(`git/trees/${encodeURIComponent(gh.branch)}?recursive=1`);
+  ghTree = new Map(t.tree.filter(x => x.type === "blob").map(x => [x.path, x.sha]));
+}
+function ghFiles(sub) {
+  const out = [];
+  for (const path of new Set([...ghTree.keys(), ...pending.keys()])) {
+    const m = path.match(/^([^/]+)\/([^/]+)$/); if (!m || m[1] !== sub || !isBook(m[2])) continue;
+    if (!pending.has(path)) out.push({ name: m[2], read: () => blob(ghTree.get(path)) });
+    else if (pending.get(path)) out.push({ name: m[2], read: async () => pending.get(path) });
+  }
+  return out;
+}
+function stage(path, data) { if (data === null && !ghTree.has(path)) pending.delete(path); else pending.set(path, data); }
+async function keepPending() { try { await IDB.set("pending:" + gh.repo, { files: [...pending], notes }); } catch (e) {} }
+async function startGitHub(cfg) {
+  gh = { repo: cfg.repo, token: cfg.token };
+  try {
+    const info = await api("");
+    if (!info.permissions?.push) throw new Error(`This GitHub account can't push to ${cfg.repo}. Ask the owner to add it as a collaborator.`);
+    gh.branch = info.default_branch;
+    try { const saved = await IDB.get("pending:" + gh.repo); pending = new Map(saved?.files || []); notes = saved?.notes || []; } catch (e) {}
+    dirP = "pcbs/"; dirJ = "projects/"; ghTree = null; setupMsg = "";
+    await loadTree();
+  } catch (e) { gh = null; throw e; }
+  try { localStorage.setItem("pcb.gh", JSON.stringify(cfg)); } catch (e) {}
+  await loadAll();
+  schedulePublish();
+}
+function signOut() {
+  clearTimeout(pubTimer);
+  try { localStorage.removeItem("pcb.gh"); } catch (e) {}
+  gh = null; ghTree = null; pending = new Map(); notes = []; dirP = dirJ = null; web = true;  // unpublished saves stay in this browser for next sign-in
+  loadAll();
+}
+function schedulePublish() {
+  clearTimeout(pubTimer);
+  if (gh && pending.size && pubMode !== "manual") pubTimer = setTimeout(publish, Number(pubMode) * 1000);
+}
+async function publish() {
+  clearTimeout(pubTimer);
+  if (!gh || publishing || !pending.size) return;
+  publishing = true; render();
+  const batch = [...pending], done = notes.length;
+  let next = schedulePublish;  // saves made while publishing go in the next commit
+  try {
+    const head = (await api("git/ref/heads/" + encodeURIComponent(gh.branch))).object.sha;
+    const base = (await api("git/commits/" + head)).tree.sha;
+    const tree = [];
+    for (const [path, data] of batch) {
+      if (!data) { tree.push({ path, mode: "100644", type: "blob", sha: null }); continue; }
+      const { sha } = await api("git/blobs", { method: "POST", body: { content: b64(data), encoding: "base64" } });
+      blobs.set(sha, data); tree.push({ path, mode: "100644", type: "blob", sha });
+    }
+    const t = await api("git/trees", { method: "POST", body: { base_tree: base, tree } });
+    const msg = (notes.slice(0, done).join("; ") || "Update tracker files").slice(0, 300) + (me ? `\n\nChanged by ${me}` : "");
+    const c = await api("git/commits", { method: "POST", body: { message: msg, tree: t.sha, parents: [head] } });
+    await api("git/refs/heads/" + encodeURIComponent(gh.branch), { method: "PATCH", body: { sha: c.sha } });
+    tree.forEach(({ path, sha }, i) => {
+      if (sha) ghTree.set(path, sha); else ghTree.delete(path);
+      if (pending.get(path) === batch[i][1]) pending.delete(path);  // a newer save of the same file stays pending
+    });
+    notes = notes.slice(done);
+    await keepPending();
+    toast("Published. The live site shows it in a minute or two.");
+  } catch (e) {
+    if (e.status === 401 || e.status === 403) { next = null; setupMsg = `GitHub refused the save: ${e.message}. Your token may have expired or can't write Contents. Sign out and sign in with a new token. Your changes are kept in this browser.`; }
+    else { toast("Couldn't publish: " + e.message + ". Trying again in a minute."); next = () => { pubTimer = setTimeout(publish, 60000); }; }
+  }
+  publishing = false;
+  if (next) next();
+  render();
+}
+function guessRepo() {
+  const m = location.hostname.match(/^([^.]+)\.github\.io$/i); if (!m) return "";
+  const seg = location.pathname.split("/").filter(Boolean)[0];
+  return `${m[1]}/${seg && !/\.html?$/i.test(seg) ? seg : location.hostname}`;
+}
+function openSignIn() {
+  let cfg = null; try { cfg = JSON.parse(localStorage.getItem("pcb.gh") || "null"); } catch (e) {}
+  $("gRepo").value = cfg?.repo || guessRepo(); $("gToken").value = ""; $("gErr").hidden = true;
+  $("ghDlg").showModal(); ($("gRepo").value ? $("gToken") : $("gRepo")).focus();
+}
+
+const readBooks = fs => Promise.all(fs.map(f => f.read().then(b => ({ name: f.name, wb: XLSX.read(b, { type: "array" }) }), () => ({ name: f.name }))));
 function readFields(ws, fields) {
   const rows = ws ? XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" }) : [];
   const by = new Map(rows.map(r => [String(r[0]).trim().toLowerCase(), r[1]]));
@@ -469,24 +632,25 @@ function readLog(wb) {
   return XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" }).slice(1).filter(r => r[0] || r[2]).map(r => ({ t: String(r[0]), by: String(r[1] || ""), text: String(r[2] || "") }));
 }
 async function loadAll() {
-  if (!root || loading) return;
+  if ((!root && !gh && !web) || loading) return;
   loading = true;
   const P = [], J = [], bad = [];
   try {
-    for await (const [name, h] of dirP.entries()) {
-      if (h.kind !== "file" || !/\.xlsx$/i.test(name) || name.startsWith("~$")) continue;
+    let pf, jf;
+    if (gh) { if (!ghTree) await loadTree(); pf = ghFiles("pcbs"); jf = ghFiles("projects"); await writeManifest(pf, jf); }
+    else if (root) { pf = await folderFiles(dirP); jf = await folderFiles(dirJ); await writeManifest(pf, jf); }
+    else { const m = await fetchManifest(); pf = webFiles("pcbs", m.pcbs); jf = webFiles("projects", m.projects); }
+    const [pb, jb] = await Promise.all([readBooks(pf), readBooks(jf)]);
+    for (const { name, wb } of pb) {
       try {
-        const wb = await readBook(h);
         const r = readFields(wb.Sheets["PCB"] || wb.Sheets[wb.SheetNames[0]], PCB_FIELDS);
         r.id = name.replace(/\.xlsx$/i, ""); r.pcb = String(r.pcb || r.id); r.log = readLog(wb);
         P.push(r);
       } catch (e) { bad.push("pcbs\\" + name); }
     }
     const byPcbName = new Map(P.map(r => [r.pcb.toLowerCase(), r.id]));
-    for await (const [name, h] of dirJ.entries()) {
-      if (h.kind !== "file" || !/\.xlsx$/i.test(name) || name.startsWith("~$")) continue;
+    for (const { name, wb } of jb) {
       try {
-        const wb = await readBook(h);
         const p = readFields(wb.Sheets["Project"] || wb.Sheets[wb.SheetNames[0]], PROJ_FIELDS);
         p.id = name.replace(/\.xlsx$/i, ""); p.name = String(p.name || p.id); p.log = readLog(wb);
         p.items = {}; p.missing = [];
@@ -500,19 +664,20 @@ async function loadAll() {
       } catch (e) { bad.push("projects\\" + name); }
     }
     pcbs = P; projects = J; unreadable = bad;
-  } catch (e) { setupMsg = "Couldn't read the folder. " + e.message; }
+  } catch (e) { setupMsg = (gh ? "Couldn't read the files from GitHub. " : root ? "Couldn't read the folder. " : "Couldn't load the published files. ") + e.message; }
   loading = false;
   render();
 }
 function sheetOf(rows, widths) { const ws = XLSX.utils.aoa_to_sheet(rows); ws["!cols"] = widths.map(w => ({ wch: w })); return ws; }
 function historySheet(log) { return sheetOf([["Time", "Changed by", "Change"], ...(log || []).map(e => [e.t, e.by, e.text])], [26, 18, 70]); }
 async function writeBook(dir, file, wb) {
+  if (gh) return stage(dir + file, new Uint8Array(XLSX.write(wb, { bookType: "xlsx", type: "array" })));
   const h = await dir.getFileHandle(file, { create: true });
   const w = await h.createWritable();
   await w.write(XLSX.write(wb, { bookType: "xlsx", type: "array" }));
   await w.close();
 }
-async function removeFile(dir, file) { try { await dir.removeEntry(file); } catch (e) { if (e.name !== "NotFoundError") throw e; } }
+async function removeFile(dir, file) { if (gh) return stage(dir + file, null); try { await dir.removeEntry(file); } catch (e) { if (e.name !== "NotFoundError") throw e; } }
 function pcbBook(r) {
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, sheetOf([["Field", "Value"], ...PCB_FIELDS.map(([k, l]) => [l, r[k] ?? ""])], [26, 34]), "PCB");
@@ -543,7 +708,7 @@ async function writeSummary() {
     jrow.push([p.name, a.Q, ...FIN_STAGES.map(s => a.c[s.k]), a.s.done, a.items.length, a.canBuild, STATE[a.state].label, a.progress, p.notes]);
   });
   XLSX.utils.book_append_sheet(wb, sheetOf(jrow, [26, 12, 10, 14, 12, 10, 12, 14, 13, 10, 30]), "Projects");
-  try { await writeBook(root, "Summary.xlsx", wb); return true; } catch (e) { return false; }
+  try { await writeBook(gh ? "" : root, "Summary.xlsx", wb); return true; } catch (e) { return false; }
 }
 function lockedMsg(e, file) {
   if (e && (e.name === "NoModificationAllowedError" || e.name === "InvalidStateError" || /lock|in use|being used/i.test(e.message || "")))
@@ -554,6 +719,10 @@ function lockedMsg(e, file) {
 async function afterWrite(msg) {
   await loadAll();
   const ok = await writeSummary();
+  if (gh) {
+    notes.push(msg); await keepPending(); schedulePublish(); render();
+    return toast(pubMode === "manual" ? `${msg}. Click Publish now to put it on the live site` : pubMode === "0" ? `${msg}. Publishing…` : `${msg}. It goes live after ${pubMode === "60" ? "1 min" : "5 min"} without more changes`);
+  }
   toast(ok ? msg : `${msg}. Summary.xlsx is open in Excel, so it wasn't refreshed.`);
 }
 function logEntry(ch) { return { t: new Date().toISOString(), by: me, text: ch.map(([k, a, b]) => k === "created" ? "Added" : k === "items" ? "Changed PCB list" : `${LABEL[k] || k}: ${a} → ${b}`).join(" · ") }; }
@@ -614,6 +783,7 @@ function legend(s, labels) {
   return l;
 }
 function button(text, cls, fn, aria) { const b = el("button", "btn " + (cls || ""), text); b.type = "button"; b.addEventListener("click", fn); if (aria) b.setAttribute("aria-label", aria); return b; }
+const ed = (...a) => canEdit() ? button(...a) : "";  // edit buttons only for the editor
 function emptyBox(title, text, btn) { const e = el("div", "empty"); e.append(el("h2", "", title)); if (text) e.append(el("p", "", text)); if (btn) [].concat(btn).forEach(b => b && e.append(b)); return e; }
 function ago(iso) {
   const d = (Date.now() - new Date(iso).getTime()) / 1000;
@@ -642,23 +812,30 @@ function summaryBox(app, { p, head, total, unit, sub, s, labels }) {
 /* ---------- render ---------- */
 function render() {
   const app = $("app"); app.innerHTML = "";
-  if (view.type === "project" && root && !projects.some(p => p.id === view.id)) view = { type: "projects" };
+  if (view.type === "project" && (root || gh || web) && !projects.some(p => p.id === view.id)) view = { type: "projects" };
   const h = el("header", "top");
   const l = el("div"); l.append(el("div", "eyebrow", "Production floor"), el("h1", "", "PCB Build Tracker"), el("div", "sub", "Every PCB from bare board to tested, and every project to fully tested pieces"));
   const a = el("div", "actions");
-  if (root) a.append(button("New project", "", () => openProject(null)), button("Add PCB", "primary", () => openPcb(null)));
+  if (canEdit()) a.append(button("New project", "", () => openProject(null)), button("Add PCB", "primary", () => openPcb(null)));
   h.append(l, a); app.append(h);
 
-  if (!window.showDirectoryPicker) {
-    app.append(emptyBox("Open this file in Chrome or Edge", "This tracker saves to Excel files in a folder on your computer. Only Google Chrome and Microsoft Edge allow a page to do that. Right-click PCB Build Tracker.html, choose Open with, and pick Chrome or Edge.", null));
-    return;
-  }
   if (typeof XLSX === "undefined") {
     app.append(emptyBox("Excel support didn't load", "The page loads its Excel reader from the internet the first time. Connect to the internet and reload the page.", button("Reload", "primary", () => location.reload())));
     return;
   }
-  if (!root) {
-    const text = "Pick the folder that holds this file. The tracker keeps one Excel file per PCB in its pcbs folder and one per project in its projects folder, plus Summary.xlsx with everything in one sheet.";
+  if (!canEdit() && !web && booting) { app.append(emptyBox("Loading…", "", null)); return; }
+  if (!canEdit() && !web && /^https?:$/.test(location.protocol)) {
+    const box = emptyBox("No published tracker data yet", "This page couldn't find files.json next to it. The editor can sign in to start adding PCBs.", button("Editor sign in", "primary", openSignIn));
+    if (setupMsg) box.append(el("p", "err", setupMsg));
+    app.append(box);
+    return;
+  }
+  if (!canEdit() && !web && !window.showDirectoryPicker) {
+    app.append(emptyBox("Open this file in Chrome or Edge", "This tracker saves to Excel files in a folder on your computer. Only Google Chrome and Microsoft Edge allow a page to do that. Right-click index.html, choose Open with, and pick Chrome or Edge.", null));
+    return;
+  }
+  if (!canEdit() && !web) {
+    const text = "Pick the folder that holds this file (your copy of the GitHub repository). The tracker keeps one Excel file per PCB in its pcbs folder and one per project in its projects folder, plus Summary.xlsx with everything in one sheet.";
     const btns = [];
     if (savedHandle) btns.push(button(`Open “${savedHandle.name}” folder`, "primary", reopenFolder));
     btns.push(button(savedHandle ? "Choose a different folder" : "Choose tracker folder", savedHandle ? "" : "primary", chooseFolder));
@@ -669,14 +846,35 @@ function render() {
   }
 
   const bar = el("div", "folderbar");
-  const f = el("span", "", "Saving to folder "); f.append(el("b", "", root.name)); bar.append(f);
-  const meL = el("label", "", "Your name "); meL.htmlFor = "me";
-  const meI = el("input"); meI.id = "me"; meI.value = me; meI.placeholder = "for the change history"; meI.autocomplete = "off";
-  meI.addEventListener("change", () => { me = meI.value.trim(); try { localStorage.setItem("pcb.me", me); } catch (e) {} });
-  bar.append(meL, meI, button("Reload files", "small", loadAll), button("Change folder", "small", chooseFolder));
+  const nameField = () => {
+    const meL = el("label", "", "Your name "); meL.htmlFor = "me";
+    const meI = el("input"); meI.id = "me"; meI.value = me; meI.placeholder = "for the change history"; meI.autocomplete = "off";
+    meI.addEventListener("change", () => { me = meI.value.trim(); try { localStorage.setItem("pcb.me", me); } catch (e) {} });
+    return [meL, meI];
+  };
+  if (gh) {
+    const f = el("span", "", "Editing "); f.append(el("b", "", gh.repo));
+    const waiting = notes.length || pending.size && 1;
+    f.append(" · ", el("span", waiting || publishing ? "pend" : "", publishing ? "Publishing…" : waiting ? `${waiting} change${waiting > 1 ? "s" : ""} not on the live site yet` : "✓ Live site is up to date"));
+    bar.append(f, ...nameField());
+    if (pending.size && !publishing) bar.append(button("Publish now", "primary small", publish));
+    const sel = el("select"); sel.setAttribute("aria-label", "When to publish");
+    PUBLISH.forEach(([v, t]) => sel.append(new Option(t, v))); sel.value = pubMode;
+    sel.addEventListener("change", () => { pubMode = sel.value; try { localStorage.setItem("pcb.publish", pubMode); } catch (e) {} schedulePublish(); });
+    bar.append(sel, button("Reload", "small", () => { ghTree = null; loadAll(); }), button("Sign out", "small", signOut));
+  } else if (root) {
+    const f = el("span", "", "Saving to folder "); f.append(el("b", "", root.name));
+    if (inGit) f.append(". Commit and push it to publish your changes.");
+    bar.append(f, ...nameField(), button("Reload files", "small", loadAll), button("Change folder", "small", chooseFolder));
+  } else {
+    const f = el("span", "", "Viewing the published tracker. "); f.append(el("b", "", "Read only."));
+    bar.append(f);
+    if (pcbs.length || projects.length) { const sum = el("a", "", "Download Summary.xlsx"); sum.href = "Summary.xlsx"; sum.download = ""; bar.append(sum); }
+    bar.append(button("Reload", "small", loadAll), button("Editor sign in", "small", openSignIn));
+  }
   app.append(bar);
   if (setupMsg) app.append(el("div", "notice", setupMsg));
-  if (unreadable.length) app.append(el("div", "notice", "Couldn't read: " + unreadable.join(", ") + ". Close them in Excel or fix them, then click Reload files."));
+  if (unreadable.length) app.append(el("div", "notice", "Couldn't read: " + unreadable.join(", ") + (root ? ". Close them in Excel or fix them, then click Reload files." : ".")));
 
   const tabs = el("div", "tabs"); tabs.setAttribute("role", "tablist");
   const tab = (label, count, on, fn) => { const t = el("button", "tab", label); t.type = "button"; t.setAttribute("role", "tab"); t.setAttribute("aria-selected", on ? "true" : "false"); t.append(el("span", "cnt", fmt(count))); t.addEventListener("click", fn); return t; };
@@ -689,6 +887,7 @@ function render() {
 
 function renderAll(app) {
   if (!pcbs.length) {
+    if (!canEdit()) { app.append(emptyBox("No PCBs published yet", "PCBs appear here once the editor adds them.", null)); return; }
     app.append(emptyBox("Add your first PCB", "Enter a PCB name and how many pieces to build. Then update the counts as boards move along. Green means done, orange means in progress, red means a count needs checking.",
       button("Add PCB", "primary", () => openPcb(null))));
     return;
@@ -732,7 +931,7 @@ function chkRow(state, name, small, p, value, onShow) {
 function renderProjects(app) {
   if (!projects.length) {
     app.append(emptyBox("No projects yet", "A project groups the PCBs that go into one finished product. Set how many of each PCB one piece needs, then track bodies, final assembly and final testing for the project.",
-      button("New project", "primary", () => openProject(null))));
+      ed("New project", "primary", () => openProject(null))));
     return;
   }
   const all = projects.map(p => ({ p, a: analyseProject(p) }));
@@ -766,14 +965,14 @@ function renderProject(app, p) {
   const l = el("div"); l.append(el("h1", "", p.name));
   l.append(el("div", "sub", [`${fmt(a.Q)} finished pieces to build`, p.notes].filter(Boolean).join(" · ")));
   const acts = el("div", "actions");
-  acts.append(button("Edit project", "", () => openProject(p.id)), button("Update final assembly", "primary", () => openFin(p.id)));
+  acts.append(ed("Edit project", "", () => openProject(p.id)), ed("Update final assembly", "primary", () => openFin(p.id)));
   tb.append(l, acts); h.append(tb); app.append(h);
-  if (p.missing.length) app.append(el("div", "notice", `This project lists PCBs that have no file in the pcbs folder: ${p.missing.join(", ")}. Add those PCBs, or remove them with Edit project.`));
+  if (p.missing.length) app.append(el("div", "notice", `This project lists PCBs that have no file in the pcbs folder: ${p.missing.join(", ")}.` + (canEdit() ? " Add those PCBs, or remove them with Edit project." : "")));
   summaryBox(app, { p: a.progress, head: a.c.fullyTested, total: a.Q, unit: "pieces fully tested",
     sub: `${a.s.done} of ${a.items.length} PCBs ready for this project` + (a.shortParts ? ` · ${a.shortParts} short of parts` : "") + ` · ${STATE[a.state].label}`,
     s: a.s, labels: { done: "PCBs ready", prog: "In progress", idle: "Not started", attn: "Check counts" } });
   const fin = el("section", "fincard"); fin.id = "fin";
-  const fh = el("div", "chead"); fh.append(el("h2", "", "Final assembly"), badge(a.state), el("span", "sp"), button("Update counts", "primary small", () => openFin(p.id)));
+  const fh = el("div", "chead"); fh.append(el("h2", "", "Final assembly"), badge(a.state), el("span", "sp"), ed("Update counts", "primary small", () => openFin(p.id)));
   fin.append(fh);
   const lane = el("section", "lane final");
   const lh = el("div", "lane-h"); const tt = el("div", "tt"); tt.append(el("span", "no", "3"), "Final assembly");
@@ -791,7 +990,7 @@ function renderProject(app, p) {
     fin.append(lim);
   }
   app.append(fin);
-  if (!a.items.length) { app.append(emptyBox("No PCBs in this project yet", "Use Edit project to tick the PCBs this product needs and set how many go into one piece.", button("Edit project", "primary", () => openProject(p.id)))); return; }
+  if (!a.items.length) { app.append(emptyBox("No PCBs in this project yet", canEdit() ? "Use Edit project to tick the PCBs this product needs and set how many go into one piece." : "", ed("Edit project", "primary", () => openProject(p.id)))); return; }
   const cl = el("section", "checklist"); cl.append(el("h2", "", "PCBs needed for this project"));
   a.items.forEach(it => cl.append(chkRow(it.st, it.r.pcb, `${it.per} per piece · need ${fmt(it.need)} tested` + (it.a.state === "attn" ? " · check counts" : it.a.short.length ? " · parts short" : ""),
     pct(it.have, it.need), `${fmt(it.have)} / ${fmt(it.need)} tested`, () => flash("card-" + it.r.id))));
@@ -805,7 +1004,7 @@ function card(r, a) {
   const head = el("div", "chead");
   head.append(el("h3", "", r.pcb), badge(a.state));
   const need = el("span", "need"); need.append("Need ", el("b", "", fmt(a.qty)), " pieces"); head.append(need);
-  head.append(el("span", "sp"), button("Update counts", "primary small", () => openPcb(r.id)));
+  head.append(el("span", "sp"), ed("Update counts", "primary small", () => openPcb(r.id)));
   c.append(head);
   const inProj = projects.filter(p => p.items[r.id]);
   if (inProj.length) { const tags = el("div", "ptags"); inProj.forEach(p => tags.append(el("span", "ptag", `Project: ${p.name} · ${per(p.items[r.id])} per piece`))); c.append(tags); }
@@ -829,7 +1028,8 @@ function card(r, a) {
     lane.append(blocks); c.append(lane);
   }
   const foot = el("div", "cfoot");
-  foot.append(el("span", "", `File: pcbs\\${r.id}.xlsx`));
+  if (root) foot.append(el("span", "", `File: pcbs\\${r.id}.xlsx`));
+  else { const dl = el("a", "", `Download pcbs/${r.id}.xlsx`); dl.href = "pcbs/" + encodeURIComponent(r.id + ".xlsx"); dl.download = ""; foot.append(dl); }
   if (r.notes) foot.append(el("span", "", "Notes: " + r.notes));
   if (r.updatedAt) foot.append(el("span", "", "Updated " + ago(r.updatedAt)));
   c.append(foot);
@@ -944,7 +1144,7 @@ $("fDelYes").addEventListener("click", async () => {
 const PCB_KEYS = ["pcb", "qty", ...PCB_STAGES.flatMap(s => s.per ? [s.k, s.per] : [s.k]), "notes"];
 $("pcbForm").addEventListener("submit", async ev => {
   ev.preventDefault();
-  if (!root || busy) return;
+  if (!canEdit() || busy) return;
   const d = formData();
   if (!d.pcb) return errText("fErr", "Enter a PCB name or number.");
   const id = safeName(d.pcb);
@@ -1026,7 +1226,7 @@ $("pDelYes").addEventListener("click", async () => {
 });
 $("projForm").addEventListener("submit", async ev => {
   ev.preventDefault();
-  if (!root || busy) return;
+  if (!canEdit() || busy) return;
   const name = $("pName").value.trim(), Q = n($("pQty").value), notes = $("pNotes").value.trim();
   if (!name) return errText("pErr", "Enter a project name.");
   const id = safeName(name);
@@ -1093,7 +1293,7 @@ function openFin(id) {
 $("nCancel").addEventListener("click", () => $("finDlg").close());
 $("finForm").addEventListener("submit", async ev => {
   ev.preventDefault();
-  if (!root || busy) return;
+  if (!canEdit() || busy) return;
   const p = projects.find(x => x.id === editingFin); if (!p) return;
   const d = finData();
   const ch = diff(Object.fromEntries(FIN_STAGES.map(s => [s.k, n(p[s.k])])), d, FIN_STAGES.map(s => s.k));
@@ -1107,18 +1307,45 @@ $("finForm").addEventListener("submit", async ev => {
 });
 
 /* ---------- boot ---------- */
+/* ---------- editor sign in ---------- */
+$("gCancel").addEventListener("click", () => $("ghDlg").close());
+$("ghForm").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  if (busy) return;
+  const repo = $("gRepo").value.trim().replace(/^https?:\/\/github\.com\//i, "").replace(/(\.git)?\/*$/, ""), token = $("gToken").value.trim();
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return errText("gErr", "Enter the repository as owner/name, for example Yogesh101010/PCB-Tracker.");
+  if (!token) return errText("gErr", "Paste your GitHub token.");
+  busy = true; $("gSave").disabled = true;
+  try { await startGitHub({ repo, token }); $("ghDlg").close(); toast("Signed in. Edits now save to GitHub."); }
+  catch (e) {
+    errText("gErr", e.status === 401 ? "GitHub didn't accept that token. Check you copied all of it and that it hasn't expired."
+      : e.status === 404 ? `Can't find ${repo}. Check the name, and that the token was given access to this repository.` : e.message);
+  }
+  finally { busy = false; $("gSave").disabled = false; }
+});
+window.addEventListener("beforeunload", ev => { if (gh && (pending.size || publishing)) ev.preventDefault(); });
+
+/* ---------- boot ---------- */
 render();
 (async () => {
-  if (!window.showDirectoryPicker || typeof XLSX === "undefined") return;
-  try { savedHandle = await IDB.get("root"); } catch (e) { savedHandle = null; }
-  if (savedHandle) {
-    try { if ((await savedHandle.queryPermission({ mode: "readwrite" })) === "granted") { await useFolder(savedHandle); return; } } catch (e) { savedHandle = null; }
+  if (typeof XLSX === "undefined") return;
+  if (/^https?:$/.test(location.protocol)) {
+    // Served from a website (GitHub Pages): the editor edits through GitHub, everyone else views the published files.
+    let cfg = null; try { cfg = JSON.parse(localStorage.getItem("pcb.gh") || "null"); } catch (e) {}
+    if (cfg) { try { await startGitHub(cfg); booting = false; return; } catch (e) { setupMsg = `Editor sign in didn't work: ${e.message}. Viewing read only. Use Editor sign in to try again.`; } }
+    try { await fetchManifest(); web = true; booting = false; await loadAll(); return; } catch (e) {}
+  } else if (window.showDirectoryPicker) {
+    try { savedHandle = await IDB.get("root"); } catch (e) { savedHandle = null; }
+    if (savedHandle) {
+      try { if ((await savedHandle.queryPermission({ mode: "readwrite" })) === "granted") { booting = false; await useFolder(savedHandle); return; } } catch (e) { savedHandle = null; }
+    }
   }
+  booting = false;
   render();
 })();
-// Pick up changes other people saved to the shared folder.
-window.addEventListener("focus", () => { if (root && !busy && !document.querySelector("dialog[open]")) loadAll(); });
-setInterval(() => { if (root && !busy && !document.hidden && !document.querySelector("dialog[open]")) loadAll(); }, 60000);
+// Pick up changes other people saved to the shared folder, or newly published files. (The GitHub editor is the only writer, so it doesn't poll.)
+window.addEventListener("focus", () => { if ((root || web) && !gh && !busy && !document.querySelector("dialog[open]")) loadAll(); });
+setInterval(() => { if ((root || web) && !gh && !busy && !document.hidden && !document.querySelector("dialog[open]")) loadAll(); }, 60000);
 </script>
 </body>
 </html>
